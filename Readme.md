@@ -49,21 +49,44 @@ Sometimes you may need to install dependencies. If your compilation fails here a
 
 ## CLI Usage
 
-To verify the modem firmware, run:
+The CLI exposes two subcommands, `verify` and `program`:
 
 ```bash
-updater verify <path_to_firmware_zip>
+# Verify the firmware on the connected device matches the package
+updater --target nrf9151 verify <path_to_firmware_zip>
+
+# Program and verify in one go
+updater --target nrf9151 program <path_to_firmware_zip>
 ```
 
-To program and verify the modem firmware, run:
+`--target` is required and selects the chip variant (`nrf9151` or `nrf9160`).
+If debug access is blocked, `updater` will attempt to restore access
+non-interactively before continuing.
 
-```bash
-updater program <path_to_firmware_zip>
-```
+### Selecting a probe
 
-The CLI auto-detects the connected nRF91 target by reading the device part number.
-If raw debug access is unavailable, `updater` will attempt to restore access using the same
-nRF91 unlock flow as the companion recovery tool before continuing.
+With a single probe connected, no extra flags are needed. With multiple
+probes, narrow the selection with any of:
+
+- `--vid 0x1366` / `--pid 0x1059` - match by USB vendor/product ID
+- `--serial <serial-number>` - match a specific probe
+- `--all-probes` - run the command against every matching probe (in
+  parallel; see below)
+
+### Mass programming with `--all-probes`
+
+`updater --target nrf9151 --all-probes program <zip>` spawns one worker
+per matching probe and programs them concurrently. Each probe gets its
+own progress bar whose message tracks the current phase
+(`Preparing device`, `Programming device`, `Verifying`,
+`Verification success`/`failed`). The process reports any per-probe
+failures and exits non-zero if any failed.
+
+### Probe speed
+
+`--speed <kHz>` sets the SWD clock (default 12000). Lower this if your
+probe rejects the requested speed (e.g. some J-Links don't support
+arbitrary frequencies).
 
 ## Developement
 
@@ -104,15 +127,46 @@ cargo build --release
 The resulting executable are located in `target/release/`:
 - `updater` - Main firmware update tool
 
-### 4. Target detection and recovery
+### 4. Target profiles and recovery
 
 The library and CLI support both `nrf9151` and `nrf9160` target profiles.
 
-- `updater` auto-detects the target profile from FICR part information
-- if debug access is blocked, `updater` first tries to restore access non-interactively
-- if the device is still locked, `updater` falls back to the nRF91 CTRL-AP erase-and-reset flow
+- `updater` requires `--target nrf9151 | nrf9160` to select the profile.
+- If debug access is blocked, `updater` first tries to restore access
+  non-interactively.
+- If the device is still locked, the nRF91 CTRL-AP erase-and-reset flow
+  runs automatically (probe-rs target sequence with `allow_erase_all`).
 
-This split exists because the modem DFU bring-up sequence is not identical across the chips. In particular, UICR programming and IPC receive masks differ between the profiles.
+This split exists because the modem DFU bring-up sequence is not
+identical across the chips. In particular, UICR programming and IPC
+receive masks differ between the profiles.
+
+## Library usage
+
+The crate is split into two layers:
+
+- `modem_updater::protocol` - `no_std`-compatible IPC DFU state machine.
+  Operates on `ModemMemory` and `Clock` traits; no probe-rs or
+  filesystem dependencies. Use this to drive modem updates from
+  external flash on embedded targets. For `no_std` consumers, disable
+  default features:
+
+  ```toml
+  modem_updater = { version = "0.1", default-features = false }
+  ```
+
+- `modem_updater::ModemUpdater` (host wrapper, requires the `std`
+  feature) glues probe-rs to `ModemMemory`, parses Nordic `.zip`
+  packages, and exposes both one-shot helpers (`verify`,
+  `program_and_verify`) and a phased API (`prepare`,
+  `program_segments`, `verify_loaded`). Use the phased API when
+  orchestrating across multiple probes.
+
+Cargo features:
+
+- `default = ["cli"]`
+- `std` - enables the host wrapper (probe-rs, zip, ihex, tempfile)
+- `cli` - implies `std`, plus the CLI dependencies (clap, indicatif)
 
 ## Acknowledgements
 
@@ -123,6 +177,10 @@ This project is based on the work of [**@maxd-nordic**](https://github.com/maxd-
 Licensed under either of
 
 - Apache License, Version 2.0 ([LICENSE-APACHE](LICENSE-APACHE) or
-  http://www.apache.org/licenses/LICENSE-2.0)
+  http://www.apache.org/licenses/LICENSE-2.0).
+  Apache 2.0 applies with a trademark modification (Section 6 is
+  replaced; see the preamble in [LICENSE-APACHE](LICENSE-APACHE)).
 - MIT license ([LICENSE-MIT](LICENSE-MIT) or
-  http://opensource.org/licenses/MIT) at your option.
+  http://opensource.org/licenses/MIT)
+
+at your option.

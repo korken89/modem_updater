@@ -1,6 +1,9 @@
 // Copyright 2025 Jared Wolff
 //
 // SPDX-License-Identifier: Apache-2.0 OR MIT
+//
+// Apache-2.0 applies with the trademark modification described in
+// LICENSE-APACHE.
 
 //! PC-side wrappers around the `protocol` module.
 //!
