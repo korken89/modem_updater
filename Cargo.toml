@@ -6,14 +6,39 @@ description = "Utility for updating nRF91 modem firmware"
 edition = "2021"
 license = "MIT OR Apache-2.0"
 
+[features]
+default = ["cli"]
+# Enables the PC-side host wrapper (probe-rs, zip/ihex parsing, ModemUpdater).
+# Disable for `no_std` use of the `protocol` module on-device.
+std = [
+    "dep:bin_file",
+    "dep:probe-rs",
+    "dep:regex",
+    "dep:tempfile",
+    "dep:thiserror",
+    "dep:zip",
+]
+# Dependencies required by the `updater` CLI binary. Library consumers
+# building for embedded targets should disable this.
+cli = ["std", "dep:clap", "dep:env_logger", "dep:indicatif"]
+
 [dependencies]
-bin_file = "0.1"
-chrono = "0.4"
-env_logger = "0.11"
-log = "0.4"
-probe-rs = "0.31"
-regex = "1.12"
-tempfile = "3.27"
-zip = "2.4"
-thiserror = "2.0"
-indicatif = "0.18"
+log = { version = "0.4", default-features = false }
+
+# Host (`std`) library dependencies.
+bin_file = { version = "0.1", optional = true }
+probe-rs = { version = "0.31", optional = true }
+regex = { version = "1.12", optional = true }
+tempfile = { version = "3.27", optional = true }
+thiserror = { version = "2.0", optional = true }
+zip = { version = "2.4", optional = true }
+
+# CLI-only dependencies.
+clap = { version = "4.5", features = ["derive"], optional = true }
+env_logger = { version = "0.11", optional = true }
+indicatif = { version = "0.18", optional = true }
+
+[[bin]]
+name = "updater"
+path = "src/bin/updater.rs"
+required-features = ["cli"]

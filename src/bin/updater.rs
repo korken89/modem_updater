@@ -41,74 +41,154 @@
 // OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
 // THE SOFTWARE.
 
-use std::{thread, time::Duration};
-
-use chrono::Utc;
-use indicatif::{HumanBytes, ProgressBar, ProgressState, ProgressStyle};
-use modem_updater::{ModemUpdater, TargetProfile};
-use probe_rs::{
-    architecture::arm::{
-        ap::{ApRegister, CSW, IDR},
-        dp::DpAddress,
-        sequences::DefaultArmSequence,
-        ArmDebugInterface, FullyQualifiedApAddress,
-    },
-    probe::{list::Lister, DebugProbeSelector, Probe},
-    Error, Permissions, Session,
+use std::{
+    path::{Path, PathBuf},
+    sync::mpsc,
+    thread,
+    time::{Duration, Instant},
 };
 
-fn print_usage() {
-    println!("Modem Updater Usage:");
-    println!("  updater <operation> <firmware_path>");
-    println!("\nOperations:");
-    println!("  verify   - Verify firmware at the specified path");
-    println!("  program  - Program and verify firmware at the specified path");
-    println!("\nExample:");
-    println!("  updater program _bin/mfw_nrf91x1_2.0.2.zip");
+use clap::{Parser, Subcommand};
+use indicatif::{HumanBytes, MultiProgress, ProgressBar, ProgressState, ProgressStyle};
+use modem_updater::{ModemUpdater, TargetProfile};
+use probe_rs::{
+    probe::{list::Lister, DebugProbeInfo, DebugProbeSelector, Probe},
+    Permissions, Session,
+};
+
+/// Update nRF91 modem firmware over a debug probe.
+#[derive(Parser, Debug)]
+#[command(version, about, long_about = None)]
+struct Cli {
+    /// Target nRF91 chip variant (e.g. `nrf9151` or `nrf9160`).
+    #[arg(long, short = 't', value_parser = parse_target)]
+    target: TargetProfile,
+
+    /// USB vendor ID of the debug probe (e.g. 0x2e8a or 11914).
+    #[arg(long, value_parser = parse_u16)]
+    vid: Option<u16>,
+
+    /// USB product ID of the debug probe (e.g. 0x000c or 12).
+    #[arg(long, value_parser = parse_u16)]
+    pid: Option<u16>,
+
+    /// Serial number of the debug probe.
+    #[arg(long)]
+    serial: Option<String>,
+
+    /// SWD/JTAG clock speed in kHz. Defaults to 12000; lower this if your
+    /// probe rejects the requested speed (e.g. some J-Links).
+    #[arg(long, default_value_t = 12_000)]
+    speed: u32,
+
+    /// Run the command against every connected probe (filtered by
+    /// `--vid`/`--pid` if given), rather than requiring exactly one match.
+    /// Cannot be combined with `--serial`.
+    #[arg(long = "all-probes", conflicts_with = "serial")]
+    all_probes: bool,
+
+    #[command(subcommand)]
+    command: Command,
 }
 
-struct Args {
-    operation: String,
-    path: String,
+#[derive(Subcommand, Debug)]
+enum Command {
+    /// Verify firmware on the device against the given package without programming.
+    Verify {
+        /// Path to the modem firmware .zip package.
+        path: PathBuf,
+    },
+    /// Program and verify firmware from the given package.
+    Program {
+        /// Path to the modem firmware .zip package.
+        path: PathBuf,
+    },
 }
 
-const PROBE_VENDOR_ID: u16 = 0x2e8a;
-const PROBE_PRODUCT_ID: u16 = 0x000c;
-const APP_MEM: FullyQualifiedApAddress = FullyQualifiedApAddress::v1_with_default_dp(0);
-const CTRL_AP: FullyQualifiedApAddress = FullyQualifiedApAddress::v1_with_default_dp(4);
-const FICR_INFO_PART: u64 = 0x00FF0140;
-const CTRL_ERASEALL: u64 = 0x004;
-const CTRL_ERASEALLSTATUS: u64 = 0x008;
-const CTRL_RESET: u64 = 0x000;
-const UNLOCK_RETRIES: u32 = 3;
-const ERASE_TIMEOUT_MS: u64 = 5000;
-const DHCSR: u64 = 0xE000_EDF0;
-const C_HALT: u32 = 0x2;
-const C_DEBUGEN: u32 = 0x1;
-const DBGKEY: u32 = 0xA05F_0000;
+fn parse_u16(s: &str) -> Result<u16, String> {
+    let s = s.trim();
+    if let Some(hex) = s.strip_prefix("0x").or_else(|| s.strip_prefix("0X")) {
+        u16::from_str_radix(hex, 16).map_err(|e| format!("invalid hex u16: {e}"))
+    } else {
+        s.parse::<u16>().map_err(|e| format!("invalid u16: {e}"))
+    }
+}
 
-fn parse_args() -> Result<Args, String> {
-    let mut positional: Vec<_> = std::env::args().skip(1).collect();
+fn parse_target(s: &str) -> Result<TargetProfile, String> {
+    s.parse::<TargetProfile>().map_err(|e| e.to_string())
+}
 
-    if positional.len() != 2 {
-        return Err("expected <operation> <firmware_path>".to_string());
+/// Selects which debug probes the command should run against.
+///
+/// Without `--all-probes`, exactly one probe must match the
+/// `--vid`/`--pid`/`--serial` filters. With `--all-probes`, every matching
+/// probe is returned (filter still applies, but multiple matches are OK).
+fn select_probes(lister: &Lister, cli: &Cli) -> Result<Vec<DebugProbeSelector>, String> {
+    let probes = lister.list_all();
+
+    let matches: Vec<&DebugProbeInfo> = probes
+        .iter()
+        .filter(|p| cli.vid.is_none_or(|v| p.vendor_id == v))
+        .filter(|p| cli.pid.is_none_or(|v| p.product_id == v))
+        .filter(|p| {
+            cli.serial
+                .as_deref()
+                .is_none_or(|s| p.serial_number.as_deref() == Some(s))
+        })
+        .collect();
+
+    if matches.is_empty() {
+        if probes.is_empty() {
+            return Err(
+                "No debug probe detected. Connect a programmer via USB and try again.".to_string(),
+            );
+        }
+        let mut msg =
+            String::from("No debug probe matched the supplied filter. Connected probes:\n");
+        for p in &probes {
+            msg.push_str(&format!("  - {}\n", p));
+        }
+        return Err(msg);
     }
 
-    Ok(Args {
-        operation: positional.remove(0),
-        path: positional.remove(0),
-    })
+    if cli.all_probes || matches.len() == 1 {
+        return Ok(matches.iter().map(|p| selector_for(p)).collect());
+    }
+
+    let mut msg = String::from(
+        "Multiple debug probes connected. Specify --vid/--pid/--serial to disambiguate, or pass --all-probes to run on all of them:\n",
+    );
+    for p in &matches {
+        msg.push_str(&format!("  - {}\n", p));
+    }
+    Err(msg)
 }
 
-fn open_probe(lister: &Lister) -> Probe {
-    let start = Utc::now().timestamp_millis();
+fn selector_for(info: &DebugProbeInfo) -> DebugProbeSelector {
+    DebugProbeSelector {
+        vendor_id: info.vendor_id,
+        product_id: info.product_id,
+        interface: info.interface,
+        serial_number: info.serial_number.clone(),
+    }
+}
 
-    let selector = DebugProbeSelector {
-        vendor_id: PROBE_VENDOR_ID,
-        product_id: PROBE_PRODUCT_ID,
-        interface: None,
-        serial_number: None,
-    };
+fn probe_label(selector: &DebugProbeSelector) -> String {
+    format!(
+        "{:04x}:{:04x}:{}",
+        selector.vendor_id,
+        selector.product_id,
+        selector.serial_number.as_deref().unwrap_or("?")
+    )
+}
+
+fn open_probe(
+    lister: &Lister,
+    selector: &DebugProbeSelector,
+    speed_khz: u32,
+) -> Result<Probe, String> {
+    let start = Instant::now();
+    let timeout = Duration::from_secs(2);
 
     // Suppress panic output from probe-rs internals (e.g. Glasgow driver)
     let default_hook = std::panic::take_hook();
@@ -122,24 +202,26 @@ fn open_probe(lister: &Lister) -> Probe {
         match result {
             Ok(Ok(mut probe)) => {
                 std::panic::set_hook(default_hook);
-                probe.set_speed(12000).unwrap();
-                return probe;
+                if let Err(err) = probe.set_speed(speed_khz) {
+                    log::warn!(
+                        "Unable to set probe speed to {} kHz: {}. Using default.",
+                        speed_khz,
+                        err
+                    );
+                }
+                return Ok(probe);
             }
             Ok(Err(_)) | Err(_) => {
-                let now = Utc::now().timestamp_millis();
-                if now > start + 2000 {
+                if start.elapsed() > timeout {
                     std::panic::set_hook(default_hook);
 
-                    // Check if the probe is visible on USB but failed to open
-                    let probes = lister.list(Some(&selector));
-                    if probes.is_empty() {
-                        eprintln!("\nError: No debug probe detected.");
-                        eprintln!("Please check that the programmer is connected via USB and powered on.");
+                    let probes = lister.list(Some(selector));
+                    let msg = if probes.is_empty() {
+                        "No debug probe detected. Please check that the programmer is connected via USB and powered on.".to_string()
                     } else {
-                        eprintln!("\nError: Debug probe found but unable to initialize.");
-                        eprintln!("Please check that the target board is connected to the programmer.");
-                    }
-                    std::process::exit(1);
+                        "Debug probe found but unable to initialize. Please check that the target board is connected to the programmer.".to_string()
+                    };
+                    return Err(msg);
                 }
 
                 thread::sleep(Duration::from_millis(100));
@@ -148,298 +230,191 @@ fn open_probe(lister: &Lister) -> Probe {
     }
 }
 
-fn should_try_recover(err: &Error) -> bool {
-    matches!(err, Error::Arm(_) | Error::MissingPermissions(_))
-}
+/// Attaches to the chip with `allow_erase_all`, which lets probe-rs's nRF91
+/// target sequence handle APPROTECT unlock automatically via CTRL-AP ERASEALL
+/// + soft reset when needed.
+fn attach_session(
+    lister: &Lister,
+    selector: &DebugProbeSelector,
+    chip: TargetProfile,
+    speed_khz: u32,
+) -> Result<Session, String> {
+    let probe = open_probe(lister, selector, speed_khz)?;
 
-fn detect_target_profile(mut probe: Probe) -> Result<TargetProfile, Error> {
-    probe.attach_to_unspecified()?;
-    let mut iface = probe
-        .try_into_arm_debug_interface(DefaultArmSequence::create())
-        .map_err(|(_, err)| Error::from(err))?;
-
-    iface.select_debug_port(DpAddress::Default)?;
-
-    let mut memory = iface.memory_interface(&APP_MEM).map_err(Error::from)?;
-    let part_info = format!("{:08X}", memory.read_word_32(FICR_INFO_PART)?);
-
-    match part_info.as_str() {
-        "00009160" => Ok(TargetProfile::Nrf9160),
-        "00009151" => Ok(TargetProfile::Nrf9151),
-        _ => panic!("Unknown nRF91 part number: {}", part_info),
-    }
-}
-
-fn detect_target_profile_with_recovery(lister: &Lister) -> TargetProfile {
-    match detect_target_profile(open_probe(lister)) {
-        Ok(chip) => chip,
-        Err(err) if should_try_recover(&err) => {
-            log::warn!(
-                "Initial chip detection failed: {}. Trying nRF91 unlock sequence.",
-                err
-            );
-
-            restore_debug_access(open_probe(lister)).unwrap_or_else(|recover_err| {
-                panic!(
-                    "Unable to restore debug access before chip detection: {}",
-                    recover_err
-                )
-            });
-
-            detect_target_profile(open_probe(lister)).unwrap_or_else(|retry_err| {
-                panic!(
-                    "Unable to detect target chip after recovery! Error: {}",
-                    retry_err
-                )
-            })
-        }
-        Err(err) => panic!("Unable to detect target chip! Error: {}", err),
-    }
-}
-
-fn halt_cpu_if_possible(iface: &mut dyn ArmDebugInterface) {
-    match iface.write_raw_ap_register(&APP_MEM, DHCSR, DBGKEY | C_DEBUGEN | C_HALT) {
-        Ok(_) => {
-            log::info!("CPU halted successfully");
-            thread::sleep(Duration::from_millis(10));
-        }
-        Err(err) => {
-            log::warn!("Could not halt CPU (device may be locked): {}", err);
-        }
-    }
-}
-
-fn check_debug_access(iface: &mut dyn ArmDebugInterface) -> Result<bool, Error> {
-    let csw = iface.read_raw_ap_register(&APP_MEM, CSW::ADDRESS)?;
-    let dbg_status = (csw >> 6) & 1;
-    log::info!("CSW: 0x{:08X}, DbgStatus: {}", csw, dbg_status);
-    Ok(dbg_status == 1)
-}
-
-fn perform_device_reset(iface: &mut dyn ArmDebugInterface) -> Result<(), Error> {
-    iface.write_raw_ap_register(&CTRL_AP, CTRL_RESET, 1)?;
-    thread::sleep(Duration::from_millis(1));
-    iface.write_raw_ap_register(&CTRL_AP, CTRL_RESET, 0)?;
-    thread::sleep(Duration::from_millis(20));
-    log::info!("Performed soft reset");
-    Ok(())
-}
-
-fn rapid_chip_erase(iface: &mut dyn ArmDebugInterface, timeout_ms: u64) -> Result<(), Error> {
-    iface.write_raw_ap_register(&CTRL_AP, CTRL_ERASEALL, 1)?;
-    log::warn!("Started CTRL-AP ERASEALL");
-
-    let start = std::time::Instant::now();
-    let timeout = Duration::from_millis(timeout_ms);
-
-    while start.elapsed() < Duration::from_millis(100) {
-        if iface.read_raw_ap_register(&CTRL_AP, CTRL_ERASEALLSTATUS)? == 0 {
-            log::info!("Erase completed in {:?}", start.elapsed());
-            return Ok(());
-        }
-        thread::sleep(Duration::from_millis(10));
-    }
-
-    while start.elapsed() < timeout {
-        if iface.read_raw_ap_register(&CTRL_AP, CTRL_ERASEALLSTATUS)? == 0 {
-            log::info!("Erase completed in {:?}", start.elapsed());
-            return Ok(());
-        }
-        thread::sleep(Duration::from_millis(100));
-    }
-
-    Err(Error::Timeout)
-}
-
-fn restore_debug_access(mut probe: Probe) -> Result<(), Error> {
-    probe.attach_to_unspecified()?;
-    let mut iface = probe
-        .try_into_arm_debug_interface(DefaultArmSequence::create())
-        .map_err(|(_, err)| Error::from(err))?;
-
-    iface.select_debug_port(DpAddress::Default)?;
-    halt_cpu_if_possible(&mut *iface);
-
-    if let Ok(true) = check_debug_access(&mut *iface) {
-        log::info!("Device already unlocked");
-        return Ok(());
-    }
-
-    let idr = iface
-        .read_raw_ap_register(&CTRL_AP, IDR::ADDRESS)
-        .unwrap_or(0);
-    log::info!("CTRL-AP IDR: 0x{:08X}", idr);
-    if idr == 0 {
-        return Err(Error::Other(
-            "CTRL-AP not accessible, check connections".to_string(),
-        ));
-    }
-
-    for attempt in 1..=UNLOCK_RETRIES {
-        log::warn!("Unlock attempt {}/{}", attempt, UNLOCK_RETRIES);
-        rapid_chip_erase(&mut *iface, ERASE_TIMEOUT_MS)?;
-        perform_device_reset(&mut *iface)?;
-
-        let verify_start = std::time::Instant::now();
-        let verify_timeout = Duration::from_secs(2);
-
-        while verify_start.elapsed() < verify_timeout {
-            match check_debug_access(&mut *iface) {
-                Ok(true) => {
-                    log::info!("Device unlocked successfully");
-                    return Ok(());
-                }
-                Ok(false) if verify_start.elapsed() > Duration::from_millis(500) => {
-                    log::warn!("Debug access not enabled after reset");
-                    break;
-                }
-                Ok(false) => thread::sleep(Duration::from_millis(50)),
-                Err(err) => {
-                    log::warn!("Error checking debug status: {}", err);
-                    thread::sleep(Duration::from_millis(100));
-                }
-            }
-        }
-
-        if attempt < UNLOCK_RETRIES {
-            thread::sleep(Duration::from_millis(1000));
-        }
-    }
-
-    Err(Error::Other(
-        "Failed to unlock device after all retries".to_string(),
-    ))
-}
-
-fn attach_session(lister: &Lister, chip: TargetProfile) -> Session {
-    let probe = open_probe(lister);
-
-    match probe.attach(
-        chip.probe_rs_target_name(),
-        Permissions::new().allow_erase_all(),
-    ) {
-        Ok(session) => session,
-        Err(err) if should_try_recover(&err) => {
-            log::warn!(
-                "Initial attach to {} failed: {}. Trying nRF91 unlock sequence.",
-                chip,
-                err
-            );
-
-            restore_debug_access(open_probe(lister)).unwrap_or_else(|recover_err| {
-                panic!("Unable to restore debug access: {}", recover_err)
-            });
-
-            let probe = open_probe(lister);
-            probe
-                .attach(
-                    chip.probe_rs_target_name(),
-                    Permissions::new().allow_erase_all(),
-                )
-                .unwrap_or_else(|retry_err| {
-                    panic!(
-                        "Unable to attach to probe after recovery! Error: {}",
-                        retry_err
-                    )
-                })
-        }
-        Err(err) => panic!("Unable to attach to probe! Error: {}", err),
-    }
+    probe
+        .attach(
+            chip.probe_rs_target_name(),
+            Permissions::new().allow_erase_all(),
+        )
+        .map_err(|err| format!("Unable to attach to {}: {}", chip, err))
 }
 
 fn main() {
     env_logger::init();
 
-    let args = match parse_args() {
-        Ok(args) => args,
+    let cli = Cli::parse();
+
+    let lister = Lister::new();
+    let selectors = select_probes(&lister, &cli).unwrap_or_else(|err| {
+        eprintln!("{}", err);
+        std::process::exit(1);
+    });
+
+    drop(lister);
+
+    if !run(&selectors, &cli) {
+        std::process::exit(2);
+    }
+}
+
+/// Spawn one worker per probe via [`thread::scope`]; each worker owns its
+/// own probe-rs `Session` and a single `ProgressBar` whose message changes
+/// as it moves through prepare → program → verify. In a TTY, the bar is the
+/// only output for the happy path. In a non-TTY (CI, piped output) the bar
+/// is silent — set `RUST_LOG=info` to surface progress in logs.
+fn run(selectors: &[DebugProbeSelector], cli: &Cli) -> bool {
+    let target = cli.target;
+    let speed = cli.speed;
+    let path: &Path = match &cli.command {
+        Command::Verify { path } | Command::Program { path } => path,
+    };
+    let do_program = matches!(&cli.command, Command::Program { .. });
+    let mp = MultiProgress::new();
+
+    let (tx, rx) = mpsc::channel::<(String, bool)>();
+    let mut failures: Vec<String> = Vec::new();
+
+    thread::scope(|s| {
+        for selector in selectors {
+            let label = probe_label(selector);
+            let tx = tx.clone();
+            let mp = mp.clone();
+            s.spawn(move || {
+                // `Lister` holds `Box<dyn ProbeLister>`, which is !Sync, so it
+                // can't be borrowed across threads. Constructing a fresh
+                // Lister per worker is cheap — it just registers the built-in
+                // probe drivers.
+                let lister = Lister::new();
+                let success = run_one_probe(&lister, selector, target, speed, path, do_program, &mp, &label);
+                let _ = tx.send((label, success));
+            });
+        }
+        drop(tx);
+
+        for (label, ok) in rx.iter() {
+            if !ok {
+                failures.push(label);
+            }
+        }
+    });
+
+    if !failures.is_empty() {
+        eprintln!(
+            "\n{}/{} probe(s) failed: {}",
+            failures.len(),
+            selectors.len(),
+            failures.join(", ")
+        );
+        return false;
+    }
+    true
+}
+
+#[allow(clippy::too_many_arguments)]
+fn run_one_probe(
+    lister: &Lister,
+    selector: &DebugProbeSelector,
+    target: TargetProfile,
+    speed: u32,
+    path: &Path,
+    do_program: bool,
+    mp: &MultiProgress,
+    label: &str,
+) -> bool {
+    let bar = mp.add(ProgressBar::new(0));
+    bar.set_prefix(format!("[{}]", label));
+    bar.set_style(idle_progress_style());
+    bar.set_message("Preparing device");
+    bar.enable_steady_tick(Duration::from_millis(100));
+
+    let mut session = match attach_session(lister, selector, target, speed) {
+        Ok(s) => s,
         Err(err) => {
-            eprintln!("Argument error: {err}");
-            print_usage();
-            std::process::exit(1);
+            bar.finish_with_message(format!("attach error: {}", err));
+            return false;
         }
     };
 
-    if args.operation != "verify" && args.operation != "program" {
-        println!("\nError: Unknown operation '{}'", args.operation);
-        print_usage();
-        std::process::exit(1);
+    let mut updater = ModemUpdater::new_with_target(&mut session, target);
+
+    if let Err(err) = updater.prepare(path) {
+        bar.finish_with_message(format!("prepare error: {}", err));
+        return false;
     }
 
-    let lister = Lister::new();
-    let chip = detect_target_profile_with_recovery(&lister);
+    if do_program {
+        bar.set_style(programming_progress_style());
+        bar.set_message("Programming device");
 
-    let mut session = attach_session(&lister, chip);
-
-    // Get updater
-    let mut updater = ModemUpdater::new_with_target(&mut session, chip);
-
-    if args.operation == "verify" {
-        match updater.verify(&args.path) {
-            Ok(true) => println!("Firmware verification succeeded."),
-            Ok(false) => {
-                eprintln!("Firmware verification failed. Inspect device logs for details.");
-                std::process::exit(2);
-            }
-            Err(err) => {
-                eprintln!("Verification error: {err}");
-                std::process::exit(2);
-            }
-        }
-    } else if args.operation == "program" {
-        let progress_bar = ProgressBar::new(0);
-        progress_bar.set_style(
-            ProgressStyle::with_template(
-                "{spinner:.green} [{elapsed_precise}] [{wide_bar:.cyan/blue}] {bytes}/{total_bytes} ({eta})",
-            )
-            .unwrap()
-            .with_key("bytes", |state: &ProgressState, w: &mut dyn std::fmt::Write| {
-                let _ = write!(w, "{}", HumanBytes(state.pos()));
-            })
-            .with_key("total_bytes", |state: &ProgressState, w: &mut dyn std::fmt::Write| {
-                if let Some(len) = state.len() {
-                    let _ = write!(w, "{}", HumanBytes(len));
-                } else {
-                    let _ = w.write_str("0 B");
-                }
-            })
-            .progress_chars("=>-"),
-        );
-        progress_bar.enable_steady_tick(Duration::from_millis(100));
-
+        let bar_for_cb = bar.clone();
         updater.set_progress_callback({
-            let progress = progress_bar.clone();
             let mut initialized = false;
-            move |current, total| {
+            move |cur, tot| {
                 if !initialized {
-                    progress.set_length(total);
+                    bar_for_cb.set_length(tot);
                     initialized = true;
                 }
-
-                progress.set_position(current.min(total));
-
-                if current >= total {
-                    progress.finish_and_clear();
-                }
+                bar_for_cb.set_position(cur.min(tot));
             }
         });
 
-        match updater.program_and_verify(&args.path) {
-            Ok(true) => {
-                progress_bar.finish_and_clear();
-                println!("Programming complete. Firmware verification succeeded.");
-            }
-            Ok(false) => {
-                progress_bar.finish_and_clear();
-                eprintln!(
-                    "Programming finished but firmware verification failed. Re-run verify for details."
-                );
-                std::process::exit(3);
-            }
-            Err(err) => {
-                progress_bar.finish_and_clear();
-                eprintln!("Programming error: {err}");
-                std::process::exit(3);
-            }
+        if let Err(err) = updater.program_segments() {
+            bar.finish_with_message(format!("program error: {}", err));
+            return false;
         }
     }
+
+    bar.set_style(idle_progress_style());
+    bar.set_message("Verifying");
+
+    let (msg, ok) = match updater.verify_loaded() {
+        Ok(true) => ("Verification success".to_string(), true),
+        Ok(false) => ("Verification failed".to_string(), false),
+        Err(err) => (format!("Error: {}", err), false),
+    };
+    bar.finish_with_message(msg);
+    ok
 }
+
+/// Spinner + message for phases without byte-level progress (prepare,
+/// verify, final result).
+fn idle_progress_style() -> ProgressStyle {
+    ProgressStyle::with_template("{prefix} {spinner:.green} {msg}")
+        .expect("static progress-bar template")
+}
+
+/// Bar + bytes for the segment-writing phase.
+fn programming_progress_style() -> ProgressStyle {
+    ProgressStyle::with_template(
+        "{prefix} {msg} [{wide_bar:.cyan/blue}] {bytes}/{total_bytes}",
+    )
+    .expect("static progress-bar template")
+    .with_key(
+        "bytes",
+        |state: &ProgressState, w: &mut dyn std::fmt::Write| {
+            let _ = write!(w, "{}", HumanBytes(state.pos()));
+        },
+    )
+    .with_key(
+        "total_bytes",
+        |state: &ProgressState, w: &mut dyn std::fmt::Write| {
+            if let Some(len) = state.len() {
+                let _ = write!(w, "{}", HumanBytes(len));
+            } else {
+                let _ = w.write_str("0 B");
+            }
+        },
+    )
+    .progress_chars("=>-")
+}
+
