@@ -27,6 +27,7 @@ use zip::read::ZipArchive;
 
 use crate::protocol::{
     self, hfxo_defaults, Clock, ModemMemory, ProtocolEngine, ProtocolError, TargetProfile,
+    DEFAULT_RESPONSE_TIMEOUT_MS, PREPARE_RESPONSE_TIMEOUT_MS,
 };
 
 // ---------------------------------------------------------------------------
@@ -248,11 +249,22 @@ impl<'a> ModemUpdater<'a> {
     /// [`program_segments`](Self::program_segments) and
     /// [`verify_loaded`](Self::verify_loaded).
     pub fn prepare(&mut self, mfw_zip: impl AsRef<Path>) -> Result<(), ModemUpdateError> {
-        self.emit_status("Preparing device");
-        self.setup_device()?;
-        self.emit_status("Loading firmware package");
-        self.process_zip_file(mfw_zip.as_ref())?;
-        Ok(())
+        // Setup / loader-boot / digest-read ACKs are sub-second on healthy
+        // boards; use a tight timeout so a wedged modem trips immediately
+        // and the caller's recovery path kicks in. Restore the longer
+        // default for the segment-write / verify phases that follow.
+        self.engine
+            .set_response_timeout_ms(PREPARE_RESPONSE_TIMEOUT_MS);
+        let result = (|| -> Result<(), ModemUpdateError> {
+            self.emit_status("Preparing device");
+            self.setup_device()?;
+            self.emit_status("Loading firmware package");
+            self.process_zip_file(mfw_zip.as_ref())?;
+            Ok(())
+        })();
+        self.engine
+            .set_response_timeout_ms(DEFAULT_RESPONSE_TIMEOUT_MS);
+        result
     }
 
     /// Phase 2: write all firmware segments to the modem. Requires that

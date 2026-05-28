@@ -14,8 +14,9 @@ use std::{
 
 use clap::{Parser, Subcommand};
 use indicatif::{HumanBytes, MultiProgress, ProgressBar, ProgressState, ProgressStyle};
-use modem_updater::{ModemUpdater, TargetProfile};
+use modem_updater::{ModemUpdateError, ModemUpdater, TargetProfile};
 use probe_rs::{
+    flashing::{self, FlashProgress},
     probe::{list::Lister, DebugProbeInfo, DebugProbeSelector, Probe},
     Permissions, Session,
 };
@@ -311,9 +312,45 @@ fn run_one_probe(
 
     let mut updater = ModemUpdater::new_with_target(&mut session, target);
 
-    if let Err(err) = updater.prepare(path) {
-        bar.finish_with_message(format!("prepare error: {}", err));
-        return false;
+    match updater.prepare(path) {
+        Ok(()) => {}
+        // A fresh / wedged board sometimes leaves the modem unresponsive
+        // and `wait_and_ack` times out. Mass-erase via probe-rs (we
+        // attached with `allow_erase_all`), then drop the session and
+        // re-attach fresh before retrying. Reusing the same session is
+        // not enough: probe-rs's internal target state stays tied to the
+        // wedged modem; only a fresh attach reliably brings the chip
+        // back into a clean state, the same way `probe-rs erase`
+        // followed by a fresh invocation does.
+        Err(ModemUpdateError::Timeout) => {
+            drop(updater);
+            bar.set_message("Modem unresponsive, running chip erase");
+            if let Err(err) = flashing::erase_all(&mut session, &mut FlashProgress::empty(), false) {
+                bar.finish_with_message(format!("recovery erase failed: {}", err));
+                return false;
+            }
+            drop(session);
+
+            bar.set_message("Re-attaching after erase");
+            session = match attach_session(lister, selector, target, speed) {
+                Ok(s) => s,
+                Err(err) => {
+                    bar.finish_with_message(format!("re-attach after erase failed: {}", err));
+                    return false;
+                }
+            };
+
+            bar.set_message("Preparing device (retry after erase)");
+            updater = ModemUpdater::new_with_target(&mut session, target);
+            if let Err(err) = updater.prepare(path) {
+                bar.finish_with_message(format!("prepare error after erase: {}", err));
+                return false;
+            }
+        }
+        Err(err) => {
+            bar.finish_with_message(format!("prepare error: {}", err));
+            return false;
+        }
     }
 
     if do_program {

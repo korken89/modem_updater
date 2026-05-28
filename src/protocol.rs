@@ -40,8 +40,18 @@ pub const IPC_PIPELINED_MAX_BUFFER_SIZE: usize = 0xE000;
 /// Maximum data payload per `WRITE` command in non-pipelined mode.
 pub const IPC_MAX_BUFFER_SIZE: usize = 0x10000;
 
-/// Default `wait_and_ack` timeout in milliseconds.
+/// Default `wait_and_ack` timeout in milliseconds. Sized for the heaviest
+/// in-flight operations: 57 KB pipelined chunk writes and on-modem digest
+/// computation across large ranges. Setup / loader-boot ACKs return in
+/// well under a second; for that phase consider the much shorter
+/// [`PREPARE_RESPONSE_TIMEOUT_MS`] so a wedged modem trips immediately.
 pub const DEFAULT_RESPONSE_TIMEOUT_MS: u64 = 30_000;
+
+/// Recommended `wait_and_ack` timeout for the prepare phase (setup,
+/// loader boot, key-digest read). Real ACK times here are sub-second on
+/// healthy boards; a tight bound lets the CLI catch a wedged modem
+/// almost instantly and trigger its erase-and-reattach recovery.
+pub const PREPARE_RESPONSE_TIMEOUT_MS: u64 = 2_000;
 
 // ---------------------------------------------------------------------------
 // Internal address map

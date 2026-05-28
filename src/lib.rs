@@ -46,6 +46,7 @@ pub mod protocol;
 pub use protocol::{
     hfxo_addresses, hfxo_defaults, Clock, HfxoStatus, ModemMemory, ProtocolEngine, ProtocolError,
     TargetProfile, DEFAULT_RESPONSE_TIMEOUT_MS, IPC_MAX_BUFFER_SIZE, IPC_PIPELINED_MAX_BUFFER_SIZE,
+    PREPARE_RESPONSE_TIMEOUT_MS,
 };
 
 #[cfg(feature = "std")]
