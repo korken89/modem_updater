@@ -33,7 +33,7 @@
 //!     serial_number: None,
 //! }).unwrap();
 //! let mut session = probe
-//!     .attach("nRF9151_xxAA", Permissions::new().allow_erase_all())
+//!     .attach("nRF9151_xxAA", Permissions::new())
 //!     .unwrap();
 //! let mut updater = ModemUpdater::new(&mut session);
 //! updater.program_and_verify("modem_update.zip").unwrap();
@@ -44,9 +44,9 @@
 pub mod protocol;
 
 pub use protocol::{
-    hfxo_addresses, hfxo_defaults, Clock, HfxoStatus, ModemMemory, ProtocolEngine, ProtocolError,
-    TargetProfile, DEFAULT_RESPONSE_TIMEOUT_MS, IPC_MAX_BUFFER_SIZE, IPC_PIPELINED_MAX_BUFFER_SIZE,
-    PREPARE_RESPONSE_TIMEOUT_MS,
+    Clock, DEFAULT_RESPONSE_TIMEOUT_MS, HfxoConfig, HfxoSource, HfxoStatus, IPC_CHUNK_ALIGNMENT,
+    IPC_MAX_BUFFER_SIZE, IPC_PIPELINED_MAX_BUFFER_SIZE, ModemMemory, PREPARE_RESPONSE_TIMEOUT_MS,
+    ProgrammedHfxo, ProtocolEngine, ProtocolError, TargetProfile, hfxo_addresses, hfxo_defaults,
 };
 
 #[cfg(feature = "std")]

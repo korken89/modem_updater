@@ -14,11 +14,10 @@ use std::{
 
 use clap::{Parser, Subcommand};
 use indicatif::{HumanBytes, MultiProgress, ProgressBar, ProgressState, ProgressStyle};
-use modem_updater::{ModemUpdateError, ModemUpdater, TargetProfile};
+use modem_updater::{HfxoConfig, HfxoSource, ModemUpdater, TargetProfile};
 use probe_rs::{
-    flashing::{self, FlashProgress},
-    probe::{list::Lister, DebugProbeInfo, DebugProbeSelector, Probe},
     Permissions, Session,
+    probe::{DebugProbeInfo, DebugProbeSelector, Probe, list::Lister},
 };
 
 /// Update nRF91 modem firmware over a debug probe.
@@ -46,6 +45,18 @@ struct Cli {
     #[arg(long, default_value_t = 12_000)]
     speed: u32,
 
+    /// Permit probe-rs to mass erase a locked device while attaching.
+    #[arg(long)]
+    allow_erase_all: bool,
+
+    /// HFXO clock source for custom hardware: `tcxo` or `xtal`.
+    #[arg(long, value_parser = parse_hfxo_source, requires = "hfxocnt")]
+    hfxosrc: Option<HfxoSource>,
+
+    /// UICR HFXOCNT startup count for custom hardware.
+    #[arg(long, value_parser = parse_u8, requires = "hfxosrc")]
+    hfxocnt: Option<u8>,
+
     /// Run the command against every connected probe (filtered by
     /// `--vid`/`--pid` if given), rather than requiring exactly one match.
     /// Cannot be combined with `--serial`.
@@ -58,7 +69,7 @@ struct Cli {
 
 #[derive(Subcommand, Debug)]
 enum Command {
-    /// Verify firmware on the device against the given package without programming.
+    /// Verify firmware on the device against the package without rewriting it.
     Verify {
         /// Path to the modem firmware .zip package.
         path: PathBuf,
@@ -76,6 +87,25 @@ fn parse_u16(s: &str) -> Result<u16, String> {
         u16::from_str_radix(hex, 16).map_err(|e| format!("invalid hex u16: {e}"))
     } else {
         s.parse::<u16>().map_err(|e| format!("invalid u16: {e}"))
+    }
+}
+
+fn parse_hfxo_source(s: &str) -> Result<HfxoSource, String> {
+    match s.trim().to_ascii_lowercase().as_str() {
+        "tcxo" => Ok(HfxoSource::Tcxo),
+        "xtal" => Ok(HfxoSource::Xtal),
+        other => Err(format!(
+            "unknown HFXO source {other:?}, expected tcxo or xtal"
+        )),
+    }
+}
+
+fn parse_u8(s: &str) -> Result<u8, String> {
+    let s = s.trim();
+    if let Some(hex) = s.strip_prefix("0x").or_else(|| s.strip_prefix("0X")) {
+        u8::from_str_radix(hex, 16).map_err(|e| format!("invalid hex u8: {e}"))
+    } else {
+        s.parse::<u8>().map_err(|e| format!("invalid u8: {e}"))
     }
 }
 
@@ -195,22 +225,22 @@ fn open_probe(
     }
 }
 
-/// Attaches to the chip with `allow_erase_all`, which lets probe-rs's nRF91
-/// target sequence handle APPROTECT unlock automatically via CTRL-AP ERASEALL
-/// + soft reset when needed.
 fn attach_session(
     lister: &Lister,
     selector: &DebugProbeSelector,
     chip: TargetProfile,
     speed_khz: u32,
+    allow_erase_all: bool,
 ) -> Result<Session, String> {
     let probe = open_probe(lister, selector, speed_khz)?;
+    let permissions = if allow_erase_all {
+        Permissions::new().allow_erase_all()
+    } else {
+        Permissions::new()
+    };
 
     probe
-        .attach(
-            chip.probe_rs_target_name(),
-            Permissions::new().allow_erase_all(),
-        )
+        .attach(chip.probe_rs_target_name(), permissions)
         .map_err(|err| format!("Unable to attach to {}: {}", chip, err))
 }
 
@@ -240,6 +270,12 @@ fn main() {
 fn run(selectors: &[DebugProbeSelector], cli: &Cli) -> bool {
     let target = cli.target;
     let speed = cli.speed;
+    let allow_erase_all = cli.allow_erase_all;
+    let hfxo_config = match (cli.hfxosrc, cli.hfxocnt) {
+        (Some(hfxosrc), Some(hfxocnt)) => Some(HfxoConfig::new(hfxosrc, hfxocnt)),
+        (None, None) => None,
+        _ => unreachable!("clap requires both HFXO options"),
+    };
     let path: &Path = match &cli.command {
         Command::Verify { path } | Command::Program { path } => path,
     };
@@ -260,7 +296,18 @@ fn run(selectors: &[DebugProbeSelector], cli: &Cli) -> bool {
                 // Lister per worker is cheap — it just registers the built-in
                 // probe drivers.
                 let lister = Lister::new();
-                let success = run_one_probe(&lister, selector, target, speed, path, do_program, &mp, &label);
+                let success = run_one_probe(
+                    &lister,
+                    selector,
+                    target,
+                    speed,
+                    allow_erase_all,
+                    hfxo_config,
+                    path,
+                    do_program,
+                    &mp,
+                    &label,
+                );
                 let _ = tx.send((label, success));
             });
         }
@@ -291,6 +338,8 @@ fn run_one_probe(
     selector: &DebugProbeSelector,
     target: TargetProfile,
     speed: u32,
+    allow_erase_all: bool,
+    hfxo_config: Option<HfxoConfig>,
     path: &Path,
     do_program: bool,
     mp: &MultiProgress,
@@ -302,7 +351,7 @@ fn run_one_probe(
     bar.set_message("Preparing device");
     bar.enable_steady_tick(Duration::from_millis(100));
 
-    let mut session = match attach_session(lister, selector, target, speed) {
+    let mut session = match attach_session(lister, selector, target, speed, allow_erase_all) {
         Ok(s) => s,
         Err(err) => {
             bar.finish_with_message(format!("attach error: {}", err));
@@ -311,46 +360,13 @@ fn run_one_probe(
     };
 
     let mut updater = ModemUpdater::new_with_target(&mut session, target);
+    if let Some(hfxo_config) = hfxo_config {
+        updater.set_hfxo_config(hfxo_config);
+    }
 
-    match updater.prepare(path) {
-        Ok(()) => {}
-        // A fresh / wedged board sometimes leaves the modem unresponsive
-        // and `wait_and_ack` times out. Mass-erase via probe-rs (we
-        // attached with `allow_erase_all`), then drop the session and
-        // re-attach fresh before retrying. Reusing the same session is
-        // not enough: probe-rs's internal target state stays tied to the
-        // wedged modem; only a fresh attach reliably brings the chip
-        // back into a clean state, the same way `probe-rs erase`
-        // followed by a fresh invocation does.
-        Err(ModemUpdateError::Timeout) => {
-            drop(updater);
-            bar.set_message("Modem unresponsive, running chip erase");
-            if let Err(err) = flashing::erase_all(&mut session, &mut FlashProgress::empty(), false) {
-                bar.finish_with_message(format!("recovery erase failed: {}", err));
-                return false;
-            }
-            drop(session);
-
-            bar.set_message("Re-attaching after erase");
-            session = match attach_session(lister, selector, target, speed) {
-                Ok(s) => s,
-                Err(err) => {
-                    bar.finish_with_message(format!("re-attach after erase failed: {}", err));
-                    return false;
-                }
-            };
-
-            bar.set_message("Preparing device (retry after erase)");
-            updater = ModemUpdater::new_with_target(&mut session, target);
-            if let Err(err) = updater.prepare(path) {
-                bar.finish_with_message(format!("prepare error after erase: {}", err));
-                return false;
-            }
-        }
-        Err(err) => {
-            bar.finish_with_message(format!("prepare error: {}", err));
-            return false;
-        }
+    if let Err(err) = updater.prepare(path) {
+        bar.finish_with_message(format!("prepare error: {}", err));
+        return false;
     }
 
     if do_program {
@@ -396,26 +412,76 @@ fn idle_progress_style() -> ProgressStyle {
 
 /// Bar + bytes for the segment-writing phase.
 fn programming_progress_style() -> ProgressStyle {
-    ProgressStyle::with_template(
-        "{prefix} {msg} [{wide_bar:.cyan/blue}] {bytes}/{total_bytes}",
-    )
-    .expect("static progress-bar template")
-    .with_key(
-        "bytes",
-        |state: &ProgressState, w: &mut dyn std::fmt::Write| {
-            let _ = write!(w, "{}", HumanBytes(state.pos()));
-        },
-    )
-    .with_key(
-        "total_bytes",
-        |state: &ProgressState, w: &mut dyn std::fmt::Write| {
-            if let Some(len) = state.len() {
-                let _ = write!(w, "{}", HumanBytes(len));
-            } else {
-                let _ = w.write_str("0 B");
-            }
-        },
-    )
-    .progress_chars("=>-")
+    ProgressStyle::with_template("{prefix} {msg} [{wide_bar:.cyan/blue}] {bytes}/{total_bytes}")
+        .expect("static progress-bar template")
+        .with_key(
+            "bytes",
+            |state: &ProgressState, w: &mut dyn std::fmt::Write| {
+                let _ = write!(w, "{}", HumanBytes(state.pos()));
+            },
+        )
+        .with_key(
+            "total_bytes",
+            |state: &ProgressState, w: &mut dyn std::fmt::Write| {
+                if let Some(len) = state.len() {
+                    let _ = write!(w, "{}", HumanBytes(len));
+                } else {
+                    let _ = w.write_str("0 B");
+                }
+            },
+        )
+        .progress_chars("=>-")
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn mass_erase_permission_is_opt_in() {
+        let safe =
+            Cli::try_parse_from(["updater", "--target", "nrf9151", "verify", "firmware.zip"])
+                .unwrap();
+        assert!(!safe.allow_erase_all);
+
+        let destructive = Cli::try_parse_from([
+            "updater",
+            "--target",
+            "nrf9151",
+            "--allow-erase-all",
+            "program",
+            "firmware.zip",
+        ])
+        .unwrap();
+        assert!(destructive.allow_erase_all);
+    }
+
+    #[test]
+    fn custom_hfxo_values_must_be_supplied_together() {
+        let missing_count = Cli::try_parse_from([
+            "updater",
+            "--target",
+            "nrf9151",
+            "--hfxosrc",
+            "xtal",
+            "verify",
+            "firmware.zip",
+        ]);
+        assert!(missing_count.is_err());
+
+        let custom = Cli::try_parse_from([
+            "updater",
+            "--target",
+            "nrf9151",
+            "--hfxosrc",
+            "xtal",
+            "--hfxocnt",
+            "0x30",
+            "verify",
+            "firmware.zip",
+        ])
+        .unwrap();
+        assert_eq!(custom.hfxosrc, Some(HfxoSource::Xtal));
+        assert_eq!(custom.hfxocnt, Some(0x30));
+    }
+}

@@ -15,7 +15,7 @@
 //!
 //! Typical sequence:
 //! 1. Halt the application core and ensure UICR HFXO trim is programmed
-//!    (see [`ProtocolEngine::hfxo_status`] and [`hfxo_defaults`]).
+//!    (see [`ProtocolEngine::hfxo_status`] and [`HfxoConfig`]).
 //! 2. Call [`ProtocolEngine::read_key_digest`] to pick the matching signed
 //!    loader from the firmware package.
 //! 3. Call [`ProtocolEngine::setup`] to configure IPC, SPU, mailbox, and
@@ -39,19 +39,15 @@
 pub const IPC_PIPELINED_MAX_BUFFER_SIZE: usize = 0xE000;
 /// Maximum data payload per `WRITE` command in non-pipelined mode.
 pub const IPC_MAX_BUFFER_SIZE: usize = 0x10000;
+/// Required start-address alignment for modem firmware chunks.
+pub const IPC_CHUNK_ALIGNMENT: usize = 0x2000;
 
-/// Default `wait_and_ack` timeout in milliseconds. Sized for the heaviest
-/// in-flight operations: 57 KB pipelined chunk writes and on-modem digest
-/// computation across large ranges. Setup / loader-boot ACKs return in
-/// well under a second; for that phase consider the much shorter
-/// [`PREPARE_RESPONSE_TIMEOUT_MS`] so a wedged modem trips immediately.
+/// Default operation timeout in milliseconds. Sized for chunk writes,
+/// on-modem digest computation, loader startup, and NVMC operations.
 pub const DEFAULT_RESPONSE_TIMEOUT_MS: u64 = 30_000;
 
-/// Recommended `wait_and_ack` timeout for the prepare phase (setup,
-/// loader boot, key-digest read). Real ACK times here are sub-second on
-/// healthy boards; a tight bound lets the CLI catch a wedged modem
-/// almost instantly and trigger its erase-and-reattach recovery.
-pub const PREPARE_RESPONSE_TIMEOUT_MS: u64 = 2_000;
+/// Backwards-compatible alias for the response timeout used during prepare.
+pub const PREPARE_RESPONSE_TIMEOUT_MS: u64 = DEFAULT_RESPONSE_TIMEOUT_MS;
 
 // ---------------------------------------------------------------------------
 // Internal address map
@@ -108,6 +104,12 @@ const UICR_HFXOSR_DEFAULT: u32 = 0x0000000E;
 const UICR_HFXOCNT_DEFAULT: u32 = 0x00000020;
 const UICR_ERASED: u32 = 0xFFFFFFFF;
 
+// NVMC (secure alias)
+const NVMC_READY_ADDR: u32 = 0x50039400;
+const NVMC_CONFIG_ADDR: u32 = 0x50039504;
+const NVMC_CONFIG_READ_ONLY: u32 = 0;
+const NVMC_CONFIG_WRITE_ENABLE: u32 = 1;
+
 // Loader commands
 const CMD_WRITE: u32 = 0x3;
 const CMD_VERIFY: u32 = 0x7;
@@ -138,24 +140,10 @@ impl TargetProfile {
         }
     }
 
-    fn receive_command_mask(self) -> u32 {
-        match self {
-            Self::Nrf9160 => 0x00000004,
-            Self::Nrf9151 => 0x0000FFFF,
-        }
-    }
-
-    fn receive_data_mask(self) -> u32 {
-        match self {
-            Self::Nrf9160 => 0x00000010,
-            Self::Nrf9151 => 0x0000FFFF,
-        }
-    }
-
-    /// Whether UICR writes must go through a flash algorithm (true on
-    /// nRF9151, false on nRF9160 where UICR is plain flash).
+    /// Kept for API compatibility. nRF91 UICR words are programmed through
+    /// NVMC on every supported target.
     pub fn uicr_requires_flash_algorithm(self) -> bool {
-        matches!(self, Self::Nrf9151)
+        false
     }
 }
 
@@ -217,16 +205,27 @@ pub enum ProtocolError<E> {
     Nack(u32),
     Fault,
     BufferTooLarge,
+    InvalidBank(u8),
+    MisalignedAddress(u32),
+    /// Programmed UICR HFXO words differ from the requested config.
+    HfxoMismatch,
 }
 
 impl<E: core::fmt::Display> core::fmt::Display for ProtocolError<E> {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         match self {
             ProtocolError::Memory(e) => write!(f, "memory access error: {}", e),
-            ProtocolError::Timeout => f.write_str("timeout waiting for ACK or NACK response"),
+            ProtocolError::Timeout => f.write_str("operation timed out"),
             ProtocolError::Nack(code) => write!(f, "NACK response, code {:08X}", code),
             ProtocolError::Fault => f.write_str("modem triggered FAULT_EVENT"),
             ProtocolError::BufferTooLarge => f.write_str("chunk exceeds buffer size"),
+            ProtocolError::InvalidBank(bank) => write!(f, "invalid chunk bank {}", bank),
+            ProtocolError::MisalignedAddress(addr) => {
+                write!(f, "chunk address {:08X} is not 8 KiB aligned", addr)
+            }
+            ProtocolError::HfxoMismatch => {
+                f.write_str("programmed UICR HFXO words differ from the requested values")
+            }
         }
     }
 }
@@ -248,6 +247,74 @@ impl HfxoStatus {
     pub fn fully_programmed(&self) -> bool {
         self.hfxosr_set && self.hfxocnt_set
     }
+}
+
+/// The HFXO clock source, UICR HFXOSRC bit 0 (nRF9151 PS v1.1 4.6.1.3).
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum HfxoSource {
+    /// 32 MHz temperature compensated crystal oscillator, as on Nordic's development kits.
+    Tcxo,
+    /// 32 MHz crystal oscillator.
+    Xtal,
+}
+
+impl HfxoSource {
+    /// The HFXOSRC word. Bits 1-3 stay set as in Nordic's recommended `0x0E`.
+    pub const fn uicr_word(self) -> u32 {
+        match self {
+            Self::Tcxo => UICR_HFXOSR_DEFAULT,
+            Self::Xtal => UICR_HFXOSR_DEFAULT | 1,
+        }
+    }
+
+    const fn from_uicr_word(word: u32) -> Self {
+        if word & 1 == 1 {
+            Self::Xtal
+        } else {
+            Self::Tcxo
+        }
+    }
+}
+
+/// UICR values that configure the board's high-frequency oscillator.
+///
+/// The default values match Nordic's development kits and pyOCD. Custom
+/// hardware should use the values selected during board design.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct HfxoConfig {
+    source: HfxoSource,
+    count: u8,
+}
+
+impl HfxoConfig {
+    /// `count` is the HFXOCNT startup count, debounce time `count * 64 us + 0.5 us`.
+    pub const fn new(source: HfxoSource, count: u8) -> Self {
+        Self { source, count }
+    }
+
+    pub const fn source(self) -> HfxoSource {
+        self.source
+    }
+
+    pub const fn count(self) -> u8 {
+        self.count
+    }
+}
+
+impl Default for HfxoConfig {
+    fn default() -> Self {
+        Self::new(HfxoSource::Tcxo, UICR_HFXOCNT_DEFAULT as u8)
+    }
+}
+
+/// What [`ProtocolEngine::write_hfxo_config`] does with HFXO words that are already programmed.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ProgrammedHfxo {
+    /// Keep them as they are.
+    Keep,
+    /// Fail with [`ProtocolError::HfxoMismatch`] if they differ from the config. UICR words
+    /// cannot be rewritten without an erase.
+    MustMatch,
 }
 
 /// Recommended UICR HFXO trim values: `(HFXOSR, HFXOCNT)`.
@@ -354,20 +421,72 @@ impl ProtocolEngine {
         })
     }
 
-    /// Writes the default HFXO trim values directly to UICR.
+    /// Programs erased HFXO configuration words through NVMC.
     ///
-    /// Only usable on parts where UICR is plain (non-protected) flash —
-    /// i.e. nRF9160. For nRF9151 the caller must perform the write through
-    /// the chip's flash algorithm (see [`TargetProfile::uicr_requires_flash_algorithm`]).
-    pub fn write_hfxo_defaults_raw<M: ModemMemory>(
+    /// Existing values are preserved. The caller must reset the application
+    /// core after this operation for new UICR values to take effect.
+    pub fn write_hfxo_defaults<M: ModemMemory, C: Clock>(
         &self,
         mem: &mut M,
+        clock: &C,
     ) -> Result<(), ProtocolError<M::Error>> {
-        mem.write_word_32(UICR_HFXOSR_ADDR, UICR_HFXOSR_DEFAULT)
+        self.write_hfxo_config(mem, clock, HfxoConfig::default(), ProgrammedHfxo::Keep)
+    }
+
+    /// Programs erased HFXO configuration words through NVMC. `programmed` says what to do
+    /// with words that already hold a value.
+    ///
+    /// The caller must reset the application core after this operation for new UICR values to
+    /// take effect.
+    pub fn write_hfxo_config<M: ModemMemory, C: Clock>(
+        &self,
+        mem: &mut M,
+        clock: &C,
+        config: HfxoConfig,
+        programmed: ProgrammedHfxo,
+    ) -> Result<(), ProtocolError<M::Error>> {
+        let hfxosr = mem
+            .read_word_32(UICR_HFXOSR_ADDR)
             .map_err(ProtocolError::Memory)?;
-        mem.write_word_32(UICR_HFXOCNT_ADDR, UICR_HFXOCNT_DEFAULT)
+        let hfxocnt = mem
+            .read_word_32(UICR_HFXOCNT_ADDR)
             .map_err(ProtocolError::Memory)?;
-        Ok(())
+
+        let write_hfxosr = hfxosr == UICR_ERASED;
+        let write_hfxocnt = hfxocnt == UICR_ERASED;
+        let mismatch = (!write_hfxosr && HfxoSource::from_uicr_word(hfxosr) != config.source())
+            || (!write_hfxocnt && hfxocnt & 0xFF != u32::from(config.count()));
+        if programmed == ProgrammedHfxo::MustMatch && mismatch {
+            return Err(ProtocolError::HfxoMismatch);
+        }
+        if !write_hfxosr && !write_hfxocnt {
+            return Ok(());
+        }
+
+        mem.write_word_32(NVMC_CONFIG_ADDR, NVMC_CONFIG_WRITE_ENABLE)
+            .map_err(ProtocolError::Memory)?;
+
+        let program_result = (|| {
+            self.wait_nvmc_ready(mem, clock)?;
+            if write_hfxosr {
+                mem.write_word_32(UICR_HFXOSR_ADDR, config.source().uicr_word())
+                    .map_err(ProtocolError::Memory)?;
+                self.wait_nvmc_ready(mem, clock)?;
+            }
+            if write_hfxocnt {
+                mem.write_word_32(UICR_HFXOCNT_ADDR, u32::from(config.count()))
+                    .map_err(ProtocolError::Memory)?;
+                self.wait_nvmc_ready(mem, clock)?;
+            }
+            Ok(())
+        })();
+
+        let read_only_result = mem
+            .write_word_32(NVMC_CONFIG_ADDR, NVMC_CONFIG_READ_ONLY)
+            .map_err(ProtocolError::Memory)
+            .and_then(|()| self.wait_nvmc_ready(mem, clock));
+
+        program_result.and(read_only_result)
     }
 
     /// Programs the IPC peripheral, SPU RAM permissions, mailbox header,
@@ -384,11 +503,8 @@ impl ProtocolEngine {
         m(mem.write_word_32(IPC_GPMEM0_ADDR, IPC_GPMEM0_VALUE))?;
         m(mem.write_word_32(IPC_GPMEM1_ADDR, IPC_GPMEM1_VALUE))?;
         m(mem.write_word_32(IPC_RECEIVE_FAULT_ADDR, IPC_RECEIVE_FAULT_MASK))?;
-        m(mem.write_word_32(
-            IPC_RECEIVE_COMMAND_ADDR,
-            self.target.receive_command_mask(),
-        ))?;
-        m(mem.write_word_32(IPC_RECEIVE_DATA_ADDR, self.target.receive_data_mask()))?;
+        m(mem.write_word_32(IPC_RECEIVE_COMMAND_ADDR, 0x00000004))?;
+        m(mem.write_word_32(IPC_RECEIVE_DATA_ADDR, 0x00000010))?;
 
         for n in 0..SPU_RAMREGION_COUNT {
             m(mem.write_word_32(SPU_RAMREGION_BASE + (n * 4), SPU_RAMREGION_PERM))?;
@@ -423,9 +539,9 @@ impl ProtocolEngine {
     /// Writes one chunk of firmware data to modem flash and waits for ACK.
     ///
     /// `bank` selects the double-buffer bank (0 or 1) in pipelined mode
-    /// and must be 0 in non-pipelined mode. The caller is expected to
-    /// alternate `bank` across successive calls to overlap the host upload
-    /// with modem flash writes.
+    /// and must be 0 in non-pipelined mode. Use [`stage_chunk`](Self::stage_chunk)
+    /// and [`commit_chunk`](Self::commit_chunk) separately to overlap the next
+    /// host upload with the current modem flash write.
     pub fn write_chunk<M: ModemMemory, C: Clock>(
         &self,
         mem: &mut M,
@@ -434,17 +550,38 @@ impl ProtocolEngine {
         data: &[u8],
         bank: u8,
     ) -> Result<(), ProtocolError<M::Error>> {
-        if data.len() > self.max_chunk_size() {
-            return Err(ProtocolError::BufferTooLarge);
-        }
+        self.validate_address(addr)?;
+        self.stage_chunk(mem, data, bank)?;
+        self.commit_chunk(mem, addr, data.len(), bank)?;
+        self.wait_and_ack(mem, clock)
+    }
 
-        let buf_addr = self.data_buffer_address(bank);
-        mem.write_bytes(buf_addr, data)
-            .map_err(ProtocolError::Memory)?;
+    /// Stages a firmware chunk in the selected RAM bank without committing it.
+    pub fn stage_chunk<M: ModemMemory>(
+        &self,
+        mem: &mut M,
+        data: &[u8],
+        bank: u8,
+    ) -> Result<(), ProtocolError<M::Error>> {
+        self.validate_chunk(data.len(), bank)?;
+        mem.write_bytes(self.data_buffer_address(bank), data)
+            .map_err(ProtocolError::Memory)
+    }
+
+    /// Commits a previously staged chunk without waiting for its response.
+    pub fn commit_chunk<M: ModemMemory>(
+        &self,
+        mem: &mut M,
+        addr: u32,
+        len: usize,
+        bank: u8,
+    ) -> Result<(), ProtocolError<M::Error>> {
+        self.validate_chunk(len, bank)?;
+        self.validate_address(addr)?;
 
         mem.write_word_32(MAILBOX_ARG0_ADDR, addr)
             .map_err(ProtocolError::Memory)?;
-        mem.write_word_32(MAILBOX_ARG1_ADDR, data.len() as u32)
+        mem.write_word_32(MAILBOX_ARG1_ADDR, len as u32)
             .map_err(ProtocolError::Memory)?;
 
         if self.pipelined {
@@ -459,9 +596,7 @@ impl ProtocolEngine {
         }
 
         mem.write_word_32(IPC_TASKS_SEND0, 1)
-            .map_err(ProtocolError::Memory)?;
-
-        self.wait_and_ack(mem, clock)
+            .map_err(ProtocolError::Memory)
     }
 
     /// Issues `VERIFY` for the listed `(address, length)` ranges and
@@ -489,6 +624,8 @@ impl ProtocolEngine {
         mem.write_word_32(IPC_TASKS_SEND0, 1)
             .map_err(ProtocolError::Memory)?;
 
+        // Nordic's procedure polls one event before reading the digest (nRF91 Series Production
+        // Programming 4418_1386 section 6.5).
         self.wait_and_ack(mem, clock)?;
 
         let mut digest = [0u8; 32];
@@ -570,6 +707,43 @@ impl ProtocolEngine {
 
         Ok(())
     }
+
+    fn validate_chunk<E>(&self, len: usize, bank: u8) -> Result<(), ProtocolError<E>> {
+        if len > self.max_chunk_size() {
+            return Err(ProtocolError::BufferTooLarge);
+        }
+        if (self.pipelined && bank > 1) || (!self.pipelined && bank != 0) {
+            return Err(ProtocolError::InvalidBank(bank));
+        }
+        Ok(())
+    }
+
+    fn validate_address<E>(&self, addr: u32) -> Result<(), ProtocolError<E>> {
+        if addr as usize & (IPC_CHUNK_ALIGNMENT - 1) != 0 {
+            return Err(ProtocolError::MisalignedAddress(addr));
+        }
+        Ok(())
+    }
+
+    fn wait_nvmc_ready<M: ModemMemory, C: Clock>(
+        &self,
+        mem: &mut M,
+        clock: &C,
+    ) -> Result<(), ProtocolError<M::Error>> {
+        let start = clock.now_ms();
+        loop {
+            if mem
+                .read_word_32(NVMC_READY_ADDR)
+                .map_err(ProtocolError::Memory)?
+                != 0
+            {
+                return Ok(());
+            }
+            if clock.now_ms().wrapping_sub(start) > self.response_timeout_ms {
+                return Err(ProtocolError::Timeout);
+            }
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -578,7 +752,54 @@ impl ProtocolEngine {
 
 #[cfg(test)]
 mod tests {
+    extern crate std;
+
     use super::*;
+    use std::{collections::BTreeMap, vec, vec::Vec};
+
+    #[derive(Debug, Eq, PartialEq)]
+    enum Operation {
+        WriteWord(u32, u32),
+        WriteBytes(u32, Vec<u8>),
+    }
+
+    #[derive(Default)]
+    struct MockMemory {
+        words: BTreeMap<u32, u32>,
+        operations: Vec<Operation>,
+        force_command_event: bool,
+    }
+
+    impl ModemMemory for MockMemory {
+        type Error = &'static str;
+
+        fn read_word_32(&mut self, addr: u32) -> Result<u32, Self::Error> {
+            if self.force_command_event && addr == IPC_EVENT_COMMAND {
+                return Ok(1);
+            }
+            Ok(self.words.get(&addr).copied().unwrap_or(0))
+        }
+
+        fn write_word_32(&mut self, addr: u32, value: u32) -> Result<(), Self::Error> {
+            self.words.insert(addr, value);
+            self.operations.push(Operation::WriteWord(addr, value));
+            Ok(())
+        }
+
+        fn write_bytes(&mut self, addr: u32, data: &[u8]) -> Result<(), Self::Error> {
+            self.operations
+                .push(Operation::WriteBytes(addr, data.to_vec()));
+            Ok(())
+        }
+    }
+
+    struct FixedClock;
+
+    impl Clock for FixedClock {
+        fn now_ms(&self) -> u64 {
+            0
+        }
+    }
 
     #[test]
     fn target_profile_parsing() {
@@ -613,5 +834,180 @@ mod tests {
         let (sr, cnt) = hfxo_defaults();
         assert_eq!(sr, 0x0000000E);
         assert_eq!(cnt, 0x00000020);
+    }
+
+    #[test]
+    fn setup_uses_nordic_ipc_masks_for_all_targets() {
+        for target in [TargetProfile::Nrf9160, TargetProfile::Nrf9151] {
+            let mut mem = MockMemory::default();
+            ProtocolEngine::new(target).setup(&mut mem).unwrap();
+            assert_eq!(mem.words[&IPC_RECEIVE_COMMAND_ADDR], 0x00000004);
+            assert_eq!(mem.words[&IPC_RECEIVE_DATA_ADDR], 0x00000010);
+        }
+    }
+
+    #[test]
+    fn hfxo_programming_preserves_existing_words_and_uses_nvmc() {
+        let mut mem = MockMemory::default();
+        mem.words.insert(UICR_HFXOSR_ADDR, 0x00000001);
+        mem.words.insert(UICR_HFXOCNT_ADDR, UICR_ERASED);
+        mem.words.insert(NVMC_READY_ADDR, 1);
+
+        ProtocolEngine::new(TargetProfile::Nrf9151)
+            .write_hfxo_defaults(&mut mem, &FixedClock)
+            .unwrap();
+
+        assert_eq!(mem.words[&UICR_HFXOSR_ADDR], 0x00000001);
+        assert_eq!(mem.words[&UICR_HFXOCNT_ADDR], UICR_HFXOCNT_DEFAULT);
+        assert_eq!(
+            mem.operations,
+            vec![
+                Operation::WriteWord(NVMC_CONFIG_ADDR, NVMC_CONFIG_WRITE_ENABLE),
+                Operation::WriteWord(UICR_HFXOCNT_ADDR, UICR_HFXOCNT_DEFAULT),
+                Operation::WriteWord(NVMC_CONFIG_ADDR, NVMC_CONFIG_READ_ONLY),
+            ]
+        );
+    }
+
+    #[test]
+    fn hfxo_programming_uses_board_config() {
+        let mut mem = MockMemory::default();
+        mem.words.insert(UICR_HFXOSR_ADDR, UICR_ERASED);
+        mem.words.insert(UICR_HFXOCNT_ADDR, UICR_ERASED);
+        mem.words.insert(NVMC_READY_ADDR, 1);
+
+        ProtocolEngine::new(TargetProfile::Nrf9160)
+            .write_hfxo_config(
+                &mut mem,
+                &FixedClock,
+                HfxoConfig::new(HfxoSource::Xtal, 0x30),
+                ProgrammedHfxo::MustMatch,
+            )
+            .unwrap();
+
+        assert_eq!(mem.words[&UICR_HFXOSR_ADDR], 0x0F);
+        assert_eq!(mem.words[&UICR_HFXOCNT_ADDR], 0x30);
+    }
+
+    #[test]
+    fn programmed_hfxo_words_are_kept_or_must_match() {
+        let custom = HfxoConfig::new(HfxoSource::Xtal, 0x30);
+        let cases = [
+            ((0x0E, 0x20), ProgrammedHfxo::Keep, true),
+            ((0x0E, 0x20), ProgrammedHfxo::MustMatch, false),
+            ((0x0F, 0x30), ProgrammedHfxo::MustMatch, true),
+            ((0x0F, 0x20), ProgrammedHfxo::MustMatch, false),
+        ];
+        for ((src, cnt), programmed, ok) in cases {
+            let mut mem = MockMemory::default();
+            mem.words.insert(UICR_HFXOSR_ADDR, src);
+            mem.words.insert(UICR_HFXOCNT_ADDR, cnt);
+            mem.words.insert(NVMC_READY_ADDR, 1);
+            let result = ProtocolEngine::new(TargetProfile::Nrf9151).write_hfxo_config(
+                &mut mem,
+                &FixedClock,
+                custom,
+                programmed,
+            );
+            assert_eq!(result.is_ok(), ok, "{src:#x} {cnt:#x} {programmed:?}");
+            assert_eq!(mem.words[&UICR_HFXOSR_ADDR], src);
+        }
+    }
+
+    #[test]
+    fn verify_waits_for_one_event() {
+        let mut mem = MockMemory {
+            force_command_event: true,
+            ..MockMemory::default()
+        };
+
+        let digest = ProtocolEngine::new(TargetProfile::Nrf9151)
+            .verify(&mut mem, &FixedClock, &[])
+            .unwrap();
+
+        assert_eq!(digest, [0; 32]);
+        assert_eq!(
+            mem.operations
+                .iter()
+                .filter(|operation| {
+                    matches!(
+                        operation,
+                        Operation::WriteWord(addr, value)
+                            if *addr == IPC_EVENT_COMMAND && *value == 0
+                    )
+                })
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn pipelined_operations_stage_next_bank_before_waiting() {
+        let mut engine = ProtocolEngine::new(TargetProfile::Nrf9151);
+        engine.set_pipelined(true);
+        let mut mem = MockMemory::default();
+
+        engine.stage_chunk(&mut mem, &[1, 2], 0).unwrap();
+        engine.commit_chunk(&mut mem, 0x00010000, 2, 0).unwrap();
+        engine.stage_chunk(&mut mem, &[3, 4], 1).unwrap();
+        mem.words.insert(IPC_EVENT_COMMAND, 1);
+        mem.words.insert(MAILBOX_COMMAND_ADDR, ACK_PREFIX);
+        engine.wait_and_ack(&mut mem, &FixedClock).unwrap();
+
+        let commit = mem
+            .operations
+            .iter()
+            .position(|operation| {
+                matches!(
+                    operation,
+                    Operation::WriteWord(addr, value)
+                        if *addr == IPC_TASKS_SEND0 && *value == 1
+                )
+            })
+            .unwrap();
+        let next_stage = mem
+            .operations
+            .iter()
+            .position(|operation| {
+                matches!(
+                    operation,
+                    Operation::WriteBytes(addr, data)
+                        if *addr
+                            == DATA_BUFFER_PIPELINED_BASE
+                                + IPC_PIPELINED_MAX_BUFFER_SIZE as u32
+                            && data == &[3, 4]
+                )
+            })
+            .unwrap();
+        let acknowledge = mem
+            .operations
+            .iter()
+            .position(|operation| {
+                matches!(
+                    operation,
+                    Operation::WriteWord(addr, value)
+                        if *addr == IPC_EVENT_COMMAND && *value == 0
+                )
+            })
+            .unwrap();
+        assert!(commit < next_stage);
+        assert!(next_stage < acknowledge);
+    }
+
+    #[test]
+    fn invalid_bank_and_unaligned_address_are_rejected_before_writes() {
+        let mut engine = ProtocolEngine::new(TargetProfile::Nrf9151);
+        engine.set_pipelined(true);
+        let mut mem = MockMemory::default();
+
+        assert!(matches!(
+            engine.stage_chunk(&mut mem, &[1], 2),
+            Err(ProtocolError::InvalidBank(2))
+        ));
+        assert!(matches!(
+            engine.write_chunk(&mut mem, &FixedClock, 1, &[1], 0),
+            Err(ProtocolError::MisalignedAddress(1))
+        ));
+        assert!(mem.operations.is_empty());
     }
 }

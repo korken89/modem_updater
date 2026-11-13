@@ -2,6 +2,13 @@
 
 All notable changes to this project will be documented in this file.
 
+## Unreleased
+
+- Aligned UICR, IPC setup, loader selection, chunking, pipelining, verification,
+  and digest validation with Nordic's production-programming procedure.
+- Made locked-device mass erase opt-in with `--allow-erase-all`.
+- Added board-specific HFXO configuration through `HfxoConfig` and CLI options.
+
 ## [0.1.5] - 2026-04-03
 
 - Improved error handling when no debug probe is connected. Now shows a friendly message instead of a probe-rs panic.

@@ -60,8 +60,15 @@ updater --target nrf9151 program <path_to_firmware_zip>
 ```
 
 `--target` is required and selects the chip variant (`nrf9151` or `nrf9160`).
-If debug access is blocked, `updater` will attempt to restore access
-non-interactively before continuing.
+If debug access is blocked, attaching fails without changing the device. Pass
+`--allow-erase-all` to explicitly permit CTRL-AP mass erase during attach.
+
+During preparation, erased HFXO UICR words are programmed as required by the
+Nordic procedure. The defaults (`HFXOSRC=0x0e`, `HFXOCNT=0x20`) match Nordic's
+development kits and pyOCD. Custom hardware selects its board-specific
+values with `--hfxosrc <tcxo|xtal> --hfxocnt <count>`. With these options, the
+command fails if the UICR words already hold other values, since UICR cannot be
+rewritten without an erase.
 
 ### Selecting a probe
 
@@ -132,14 +139,16 @@ The resulting executable are located in `target/release/`:
 The library and CLI support both `nrf9151` and `nrf9160` target profiles.
 
 - `updater` requires `--target nrf9151 | nrf9160` to select the profile.
-- If debug access is blocked, `updater` first tries to restore access
-  non-interactively.
-- If the device is still locked, the nRF91 CTRL-AP erase-and-reset flow
-  runs automatically (probe-rs target sequence with `allow_erase_all`).
+- If debug access is blocked, attach fails without erasing the device.
+- `--allow-erase-all` explicitly permits probe-rs to run the nRF91 CTRL-AP
+  erase-and-reset flow while attaching to a locked device.
 
-This split exists because the modem DFU bring-up sequence is not
-identical across the chips. In particular, UICR programming and IPC
-receive masks differ between the profiles.
+The target profile selects the probe-rs target. Modem loader selection is
+matched to the digest reported by the boot ROM. Nordic specifies the same
+NVMC UICR write sequence and IPC receive masks for the supported devices.
+
+UICR HFXO values depend on the board design. The library defaults to Nordic's
+development-kit values and exposes `HfxoConfig` for custom hardware.
 
 ## Library usage
 
