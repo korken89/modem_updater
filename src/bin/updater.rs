@@ -17,7 +17,7 @@ use indicatif::{HumanBytes, MultiProgress, ProgressBar, ProgressState, ProgressS
 use modem_updater::{HfxoConfig, HfxoSource, ModemUpdater, TargetProfile};
 use probe_rs::{
     Permissions, Session,
-    probe::{DebugProbeInfo, DebugProbeSelector, Probe, list::Lister},
+    probe::{DebugProbeInfo, DebugProbeSelector, Probe, WireProtocol, list::Lister},
 };
 
 /// Update nRF91 modem firmware over a debug probe.
@@ -197,6 +197,10 @@ fn open_probe(
         match result {
             Ok(Ok(mut probe)) => {
                 std::panic::set_hook(default_hook);
+                // The nRF91 debug port is SWD only, and some probes default to JTAG.
+                if let Err(err) = probe.select_protocol(WireProtocol::Swd) {
+                    return Err(format!("Unable to select SWD: {}", err));
+                }
                 if let Err(err) = probe.set_speed(speed_khz) {
                     log::warn!(
                         "Unable to set probe speed to {} kHz: {}. Using default.",

@@ -459,7 +459,7 @@ impl<'a> ModemUpdater<'a> {
         flashing::download_file(
             self.session,
             &modem_firmware_loader.path,
-            flashing::Format::Hex,
+            flashing::HexLoader,
         )?;
 
         self.emit_status("Starting modem loader");
