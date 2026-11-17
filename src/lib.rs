@@ -23,15 +23,16 @@
 //!     probe::{list::Lister, DebugProbeSelector},
 //!     Permissions,
 //! };
-//! use modem_updater::ModemUpdater;
+//! use modem_updater::{ModemUpdater, pin_reset};
 //!
 //! let lister = Lister::new();
-//! let probe = lister.open(DebugProbeSelector {
+//! let mut probe = lister.open(DebugProbeSelector {
 //!     vendor_id: 0x2e8a,
 //!     product_id: 0x000c,
 //!     interface: None,
 //!     serial_number: None,
 //! }).unwrap();
+//! pin_reset(&mut probe).unwrap();
 //! let mut session = probe
 //!     .attach("nRF9151_xxAA", Permissions::new())
 //!     .unwrap();
@@ -53,4 +54,4 @@ pub use protocol::{
 mod host;
 
 #[cfg(feature = "std")]
-pub use host::{ModemUpdateError, ModemUpdater, ProbeRsMemory, StdClock};
+pub use host::{ModemUpdateError, ModemUpdater, ProbeRsMemory, StdClock, pin_reset};

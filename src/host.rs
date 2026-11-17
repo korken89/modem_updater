@@ -14,12 +14,14 @@
 
 use bin_file::BinFile;
 use probe_rs::flashing::{self};
+use probe_rs::probe::{DebugProbeError, Probe};
 use probe_rs::{MemoryInterface, Session};
 use regex::Regex;
 use std::collections::BTreeMap;
 use std::fs::File;
 use std::io::BufRead;
 use std::path::{Path, PathBuf};
+use std::thread;
 use std::time::{Duration, Instant};
 use tempfile::TempDir;
 use thiserror::Error;
@@ -38,6 +40,8 @@ use crate::protocol::{
 pub enum ModemUpdateError {
     #[error("{0}")]
     ProbeError(#[from] probe_rs::Error),
+    #[error("{0}")]
+    DebugProbe(#[from] DebugProbeError),
     #[error("{0}")]
     FileDownloadError(#[from] flashing::FileDownloadError),
     #[error("I/O error: {0}")]
@@ -133,6 +137,24 @@ impl Clock for StdClock {
     fn now_ms(&self) -> u64 {
         self.start.elapsed().as_millis() as u64
     }
+}
+
+// ---------------------------------------------------------------------------
+// Pin reset
+// ---------------------------------------------------------------------------
+
+/// Pulses nRESET on an opened probe, then waits for the target to boot. Call it before
+/// [`Probe::attach`].
+///
+/// A pin reset also clears state that soft resets keep, and without it the modem can ignore the
+/// DFU handshake after it ran firmware. The pulse is released before attaching, so firmware that
+/// reopens the nRF91x1 debug port can do so first.
+pub fn pin_reset(probe: &mut Probe) -> Result<(), ModemUpdateError> {
+    probe.target_reset_assert()?;
+    thread::sleep(Duration::from_millis(10));
+    probe.target_reset_deassert()?;
+    thread::sleep(Duration::from_millis(100));
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------

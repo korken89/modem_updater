@@ -14,7 +14,7 @@ use std::{
 
 use clap::{Parser, Subcommand};
 use indicatif::{HumanBytes, MultiProgress, ProgressBar, ProgressState, ProgressStyle};
-use modem_updater::{HfxoConfig, HfxoSource, ModemUpdater, TargetProfile};
+use modem_updater::{HfxoConfig, HfxoSource, ModemUpdater, TargetProfile, pin_reset};
 use probe_rs::{
     Permissions, Session,
     probe::{DebugProbeInfo, DebugProbeSelector, Probe, WireProtocol, list::Lister},
@@ -229,20 +229,6 @@ fn open_probe(
     }
 }
 
-/// Pulses nRESET. A pin reset also clears state that soft resets keep, and without it the modem
-/// can ignore the DFU handshake after it ran firmware. The pulse is released before attaching, so
-/// firmware that reopens the nRF91x1 debug port can do so first.
-fn pin_reset(probe: &mut Probe) {
-    let pulse = probe.target_reset_assert().and_then(|()| {
-        thread::sleep(Duration::from_millis(10));
-        probe.target_reset_deassert()
-    });
-    match pulse {
-        Ok(()) => thread::sleep(Duration::from_millis(100)),
-        Err(err) => log::warn!("No pin reset before attaching: {}", err),
-    }
-}
-
 fn attach_session(
     lister: &Lister,
     selector: &DebugProbeSelector,
@@ -251,7 +237,9 @@ fn attach_session(
     allow_erase_all: bool,
 ) -> Result<Session, String> {
     let mut probe = open_probe(lister, selector, speed_khz)?;
-    pin_reset(&mut probe);
+    if let Err(err) = pin_reset(&mut probe) {
+        log::warn!("No pin reset before attaching: {}", err);
+    }
     let permissions = if allow_erase_all {
         Permissions::new().allow_erase_all()
     } else {

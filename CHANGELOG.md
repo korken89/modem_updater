@@ -8,6 +8,7 @@ All notable changes to this project will be documented in this file.
   and digest validation with Nordic's production-programming procedure.
 - Made locked-device mass erase opt-in with `--allow-erase-all`.
 - Added board-specific HFXO configuration through `HfxoConfig` and CLI options.
+- Added `pin_reset` to pulse nRESET before attaching.
 
 ## [0.1.5] - 2026-04-03
 
