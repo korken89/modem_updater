@@ -17,7 +17,9 @@ use indicatif::{HumanBytes, MultiProgress, ProgressBar, ProgressState, ProgressS
 use modem_updater::{HfxoConfig, HfxoSource, ModemUpdater, TargetProfile, pin_reset};
 use probe_rs::{
     Permissions, Session,
-    probe::{DebugProbeInfo, DebugProbeSelector, Probe, WireProtocol, list::Lister},
+    probe::{
+        DebugProbeInfo, DebugProbeSelector, Probe, ProbeTransport, WireProtocol, list::Lister,
+    },
 };
 
 /// Update nRF91 modem firmware over a debug probe.
@@ -123,12 +125,14 @@ fn select_probes(lister: &Lister, cli: &Cli) -> Result<Vec<DebugProbeSelector>, 
 
     let matches: Vec<&DebugProbeInfo> = probes
         .iter()
-        .filter(|p| cli.vid.is_none_or(|v| p.vendor_id == v))
-        .filter(|p| cli.pid.is_none_or(|v| p.product_id == v))
         .filter(|p| {
-            cli.serial
-                .as_deref()
-                .is_none_or(|s| p.serial_number.as_deref() == Some(s))
+            let ProbeTransport::Usb(usb) = &p.transport;
+            cli.vid.is_none_or(|v| usb.vendor_id == v)
+                && cli.pid.is_none_or(|v| usb.product_id == v)
+                && cli
+                    .serial
+                    .as_deref()
+                    .is_none_or(|s| usb.serial_number.as_deref() == Some(s))
         })
         .collect();
 
@@ -147,7 +151,7 @@ fn select_probes(lister: &Lister, cli: &Cli) -> Result<Vec<DebugProbeSelector>, 
     }
 
     if cli.all_probes || matches.len() == 1 {
-        return Ok(matches.iter().map(|p| selector_for(p)).collect());
+        return Ok(matches.iter().map(|&p| p.into()).collect());
     }
 
     let mut msg = String::from(
@@ -159,16 +163,8 @@ fn select_probes(lister: &Lister, cli: &Cli) -> Result<Vec<DebugProbeSelector>, 
     Err(msg)
 }
 
-fn selector_for(info: &DebugProbeInfo) -> DebugProbeSelector {
-    DebugProbeSelector {
-        vendor_id: info.vendor_id,
-        product_id: info.product_id,
-        interface: info.interface,
-        serial_number: info.serial_number.clone(),
-    }
-}
-
 fn probe_label(selector: &DebugProbeSelector) -> String {
+    let DebugProbeSelector::Usb(selector) = selector;
     format!(
         "{:04x}:{:04x}:{}",
         selector.vendor_id,

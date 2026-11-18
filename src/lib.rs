@@ -26,12 +26,8 @@
 //! use modem_updater::{ModemUpdater, pin_reset};
 //!
 //! let lister = Lister::new();
-//! let mut probe = lister.open(DebugProbeSelector {
-//!     vendor_id: 0x2e8a,
-//!     product_id: 0x000c,
-//!     interface: None,
-//!     serial_number: None,
-//! }).unwrap();
+//! let selector: DebugProbeSelector = "2e8a:000c".parse().unwrap();
+//! let mut probe = lister.open(selector).unwrap();
 //! pin_reset(&mut probe).unwrap();
 //! let mut session = probe
 //!     .attach("nRF9151_xxAA", Permissions::new())
