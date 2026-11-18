@@ -1179,7 +1179,7 @@ checksum = "439ee305def115ba05938db6eb1644ff94165c5ab5e9420d1c1bcedbba909391"
 [[package]]
 name = "probe-rs"
 version = "0.32.0"
-source = "git+https://github.com/probe-rs/probe-rs?rev=8a254330dc4917e75d9d4b2329faf4c822eb3ad6#8a254330dc4917e75d9d4b2329faf4c822eb3ad6"
+source = "git+https://github.com/probe-rs/probe-rs?rev=154868d860b513b25065184507cacf4038e0398f#154868d860b513b25065184507cacf4038e0398f"
 dependencies = [
  "anyhow",
  "bincode",
@@ -1214,7 +1214,7 @@ dependencies = [
 [[package]]
 name = "probe-rs-target"
 version = "0.32.0"
-source = "git+https://github.com/probe-rs/probe-rs?rev=8a254330dc4917e75d9d4b2329faf4c822eb3ad6#8a254330dc4917e75d9d4b2329faf4c822eb3ad6"
+source = "git+https://github.com/probe-rs/probe-rs?rev=154868d860b513b25065184507cacf4038e0398f#154868d860b513b25065184507cacf4038e0398f"
 dependencies = [
  "base64 0.23.1",
  "bincode",
