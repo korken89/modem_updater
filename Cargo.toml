@@ -31,7 +31,7 @@ log = { version = "0.4", default-features = false }
 # Host (`std`) library dependencies.
 bin_file = { version = "0.1", optional = true }
 # Git master for CH347 SWD support (probe-rs PR 4354).
-probe-rs = { git = "https://github.com/probe-rs/probe-rs", rev = "154868d860b513b25065184507cacf4038e0398f", optional = true }
+probe-rs = { git = "https://github.com/probe-rs/probe-rs", rev = "187f19a8ce463e75470f48583fb3a3986403b145", optional = true }
 regex = { version = "1.12", optional = true }
 tempfile = { version = "3.27", optional = true }
 thiserror = { version = "2.0", optional = true }

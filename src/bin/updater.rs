@@ -126,7 +126,9 @@ fn select_probes(lister: &Lister, cli: &Cli) -> Result<Vec<DebugProbeSelector>, 
     let matches: Vec<&DebugProbeInfo> = probes
         .iter()
         .filter(|p| {
-            let ProbeTransport::Usb(usb) = &p.transport;
+            let ProbeTransport::Usb(usb) = &p.transport else {
+                return false;
+            };
             cli.vid.is_none_or(|v| usb.vendor_id == v)
                 && cli.pid.is_none_or(|v| usb.product_id == v)
                 && cli
@@ -161,16 +163,6 @@ fn select_probes(lister: &Lister, cli: &Cli) -> Result<Vec<DebugProbeSelector>, 
         msg.push_str(&format!("  - {}\n", p));
     }
     Err(msg)
-}
-
-fn probe_label(selector: &DebugProbeSelector) -> String {
-    let DebugProbeSelector::Usb(selector) = selector;
-    format!(
-        "{:04x}:{:04x}:{}",
-        selector.vendor_id,
-        selector.product_id,
-        selector.serial_number.as_deref().unwrap_or("?")
-    )
 }
 
 fn open_probe(
@@ -290,7 +282,7 @@ fn run(selectors: &[DebugProbeSelector], cli: &Cli) -> bool {
 
     thread::scope(|s| {
         for selector in selectors {
-            let label = probe_label(selector);
+            let label = selector.to_string();
             let tx = tx.clone();
             let mp = mp.clone();
             s.spawn(move || {
