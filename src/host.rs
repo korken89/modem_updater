@@ -19,7 +19,7 @@ use probe_rs::{MemoryInterface, Session};
 use regex::Regex;
 use std::collections::BTreeMap;
 use std::fs::File;
-use std::io::BufRead;
+use std::io::{BufRead, Read, Seek};
 use std::path::{Path, PathBuf};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -288,6 +288,15 @@ impl<'a> ModemUpdater<'a> {
         self.verify_loaded()
     }
 
+    /// Like [`verify`](Self::verify), with the package read from `mfw_zip`.
+    pub fn verify_from_reader(
+        &mut self,
+        mfw_zip: impl Read + Seek,
+    ) -> Result<bool, ModemUpdateError> {
+        self.prepare_from_reader(mfw_zip)?;
+        self.verify_loaded()
+    }
+
     /// Run the full program+verify pipeline (prepare → program_segments →
     /// verify_loaded).
     pub fn program_and_verify(
@@ -304,10 +313,19 @@ impl<'a> ModemUpdater<'a> {
     /// [`program_segments`](Self::program_segments) and
     /// [`verify_loaded`](Self::verify_loaded).
     pub fn prepare(&mut self, mfw_zip: impl AsRef<Path>) -> Result<(), ModemUpdateError> {
+        self.prepare_from_reader(File::open(mfw_zip)?)
+    }
+
+    /// Like [`prepare`](Self::prepare), with the package read from `mfw_zip`, e.g. a
+    /// `Cursor` over a package embedded in the binary.
+    pub fn prepare_from_reader(
+        &mut self,
+        mfw_zip: impl Read + Seek,
+    ) -> Result<(), ModemUpdateError> {
         self.emit_status("Preparing device");
         self.setup_device()?;
         self.emit_status("Loading firmware package");
-        self.process_zip_file(mfw_zip.as_ref())
+        self.process_zip(mfw_zip)
     }
 
     /// Phase 2: write all firmware segments to the modem. Requires that
@@ -401,7 +419,7 @@ impl<'a> ModemUpdater<'a> {
             .map_err(Into::into)
     }
 
-    fn process_zip_file(&mut self, mfw_zip: &Path) -> Result<(), ModemUpdateError> {
+    fn process_zip(&mut self, mfw_zip: impl Read + Seek) -> Result<(), ModemUpdateError> {
         self.segments.clear();
         self.firmware_update_digest = None;
         self.temp_dir = None;
@@ -409,8 +427,7 @@ impl<'a> ModemUpdater<'a> {
 
         self.emit_status("Extracting firmware package");
         let temp_dir = TempDir::new()?;
-        let file = File::open(mfw_zip)?;
-        ZipArchive::new(file)?.extract(temp_dir.path())?;
+        ZipArchive::new(mfw_zip)?.extract(temp_dir.path())?;
 
         let digest_id = self.read_key_digest_string()?;
 
